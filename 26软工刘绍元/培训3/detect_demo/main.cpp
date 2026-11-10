@@ -15,6 +15,7 @@ struct Light {
     std::array<cv::Point2f, 4> corners;
     double length;
     double angle;
+    double brightness;
 };
 
 struct Armor {
@@ -23,19 +24,26 @@ struct Armor {
     double score;
 };
 
-std::vector<Light> findLights(const cv::Mat& image) {
-    cv::Mat hsv, low, high, mask;
+std::vector<Light> findLights(const cv::Mat& image, const std::vector<cv::Mat>& bgr) {
+    cv::Mat hsv, low, high, mask, maxGB, redDiff;
     cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
-    cv::inRange(hsv, cv::Scalar(0, 100, 60), cv::Scalar(12, 255, 255), low);
-    cv::inRange(hsv, cv::Scalar(168, 100, 60), cv::Scalar(179, 255, 255), high);
+    cv::max(bgr[0], bgr[1], maxGB);
+    cv::subtract(bgr[2], maxGB, redDiff);
+    cv::threshold(redDiff, redDiff, 45, 255, cv::THRESH_BINARY);
+    cv::inRange(hsv, cv::Scalar(0, 120, 110), cv::Scalar(10, 255, 255), low);
+    cv::inRange(hsv, cv::Scalar(170, 120, 110), cv::Scalar(179, 255, 255), high);
     cv::bitwise_or(low, high, mask);
+    cv::bitwise_and(mask, redDiff, mask);
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN,
+                    cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
     cv::morphologyEx(mask, mask, cv::MORPH_CLOSE,
                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     std::vector<Light> lights;
     for (const auto& contour : contours) {
-        if (cv::contourArea(contour) < 10) continue;
+        double area = cv::contourArea(contour);
+        if (area < 12) continue;
         cv::RotatedRect rect = cv::minAreaRect(contour);
         std::array<cv::Point2f, 4> corners;
         rect.points(corners.data());
@@ -48,24 +56,28 @@ std::vector<Light> findLights(const cv::Mat& image) {
         cv::Point2f bottom = (corners[2] + corners[3]) * 0.5f;
         double length = cv::norm(bottom - top);
         double width = cv::norm(corners[0] - corners[1]);
-        if (width < 1 || length < 8) continue;
+        if (width < 2 || length < 12 || length > 0.6 * image.rows) continue;
         double ratio = length / width;
         double angle = std::atan2(bottom.x - top.x, bottom.y - top.y) * 180 / CV_PI;
-        if (ratio < 1.5 || ratio > 20 || std::abs(angle) > 45) continue;
-        lights.push_back({rect.center, corners, length, angle});
+        if (ratio < 2.5 || ratio > 20 || std::abs(angle) > 30) continue;
+        if (area / (rect.size.width * rect.size.height) < 0.45) continue;
+        cv::Rect roi = cv::boundingRect(contour) & cv::Rect(cv::Point(), image.size());
+        cv::Mat local = cv::Mat::zeros(roi.size(), CV_8U);
+        std::vector<cv::Point> shifted = contour;
+        for (auto& point : shifted) point -= roi.tl();
+        cv::drawContours(local, std::vector<std::vector<cv::Point>>{shifted}, -1,
+                         cv::Scalar(255), -1);
+        double brightness = cv::mean(bgr[2](roi), local)[0];
+        lights.push_back({rect.center, corners, length, angle, brightness});
     }
-    double longest = 0;
-    for (const auto& light : lights) longest = std::max(longest, light.length);
-    lights.erase(std::remove_if(lights.begin(), lights.end(), [&](const Light& light) {
-        return light.length < longest * 0.3;
-    }), lights.end());
     std::sort(lights.begin(), lights.end(), [](const Light& a, const Light& b) {
         return a.center.x < b.center.x;
     });
     return lights;
 }
 
-std::vector<Armor> matchLights(const std::vector<Light>& lights) {
+std::vector<Armor> matchLights(const std::vector<Light>& lights,
+                               const cv::Mat& redChannel) {
     std::vector<Armor> candidates;
     for (int i = 0; i < static_cast<int>(lights.size()); ++i) {
         for (int j = i + 1; j < static_cast<int>(lights.size()); ++j) {
@@ -80,7 +92,18 @@ std::vector<Armor> matchLights(const std::vector<Light>& lights) {
             double error = std::max(std::abs(left.angle + roll),
                                     std::abs(right.angle + roll));
             if (ratio < 1 || ratio > 5 || sideRatio > 1.6) continue;
-            if (error > 28 || std::abs(left.angle - right.angle) > 22) continue;
+            if (error > 24 || std::abs(left.angle - right.angle) > 16) continue;
+            if (std::abs(delta.y) > 0.4 * length) continue;
+            if (std::abs(left.brightness - right.brightness) > 55) continue;
+            cv::Point2f mid = (left.center + right.center) * 0.5f;
+            int half = cvRound(0.3 * length);
+            cv::Rect center(cvRound(mid.x) - half, cvRound(mid.y) - half,
+                            half * 2, half * 2);
+            center &= cv::Rect(cv::Point(), redChannel.size());
+            if (center.width < 3 || center.height < 3) continue;
+            double middle = cv::mean(redChannel(center))[0];
+            double bars = (left.brightness + right.brightness) * 0.5;
+            if (bars < 90 || middle > bars * 0.72) continue;
             double score = (sideRatio - 1) * 3 + error / 28 + std::abs(ratio - 2.2) * 0.2;
             candidates.push_back({i, j, score});
         }
@@ -177,9 +200,11 @@ int main(int argc, char** argv) {
         int totalArmors = 0;
         int totalLights = 0;
         const int delay = std::max(1, cvRound(1000 / fps));
+        std::vector<cv::Mat> bgr;
         do {
-            auto lights = findLights(frame);
-            auto armors = matchLights(lights);
+            cv::split(frame, bgr);
+            auto lights = findLights(frame, bgr);
+            auto armors = matchLights(lights, bgr[2]);
             totalLights += static_cast<int>(lights.size());
             totalArmors += static_cast<int>(armors.size());
             if (!armors.empty()) ++detected;
